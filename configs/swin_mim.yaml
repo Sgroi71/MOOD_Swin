@@ -1,0 +1,17 @@
+# Config defaults per training SWIN con MIM
+# Modifica i valori qui o passa un file differente via --config
+
+data_path: 'home/jovian/nfs/datasets/imagenet'
+batch_size: 256
+epochs: 300
+model: 'swin_base_patch4_window7_224'
+mask_patches: null
+d_vae_path: ''
+d_vae_type: 'dall-e' #customized
+output_dir: 'home/jovian/nfs/lsgroi/swin_MIM/outputs/swin_mim'
+device: 'cuda'
+seed: 0
+num_workers: 10
+input_size: 224
+second_input_size: 112
+trial: 0
