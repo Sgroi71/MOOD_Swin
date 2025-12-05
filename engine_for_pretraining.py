@@ -15,9 +15,22 @@ from typing import Iterable
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 import utils
 print_freq = 1000
+
+
+def _model_supports_masked_pos(model):
+    """Check if model forward accepts bool_masked_pos argument."""
+    import inspect
+    # Get the actual model (unwrap DDP if needed)
+    m = model.module if hasattr(model, 'module') else model
+    sig = inspect.signature(m.forward)
+    supports = 'bool_masked_pos' in sig.parameters
+    print(f"[DEBUG] Model type: {type(m).__name__}, supports_masked_pos: {supports}")
+    return supports
+
 
 def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -30,7 +43,15 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     
-    for step, (batch, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    # Check if model supports masked position argument
+    supports_masked_pos = _model_supports_masked_pos(model)
+    
+    # Wrap data_loader with tqdm for progress bar
+    total_steps = len(data_loader)
+    pbar = tqdm(enumerate(metric_logger.log_every(data_loader, print_freq, header)), 
+                total=total_steps, desc=f"Epoch {epoch}", leave=True)
+    
+    for step, (batch, _) in pbar:
         # assign learning rate & weight decay for each step
         it = start_steps + step  # global training iteration
         if lr_schedule_values is not None or wd_schedule_values is not None:
@@ -51,8 +72,33 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
             labels = input_ids[bool_masked_pos]
 
         with torch.cuda.amp.autocast():
-            outputs = model(samples, bool_masked_pos=bool_masked_pos, return_all_tokens=False)  # torch.Size([74, 8192])
-            loss = nn.CrossEntropyLoss()(input=outputs, target=labels)                          # torch.Size([74])
+            if supports_masked_pos:
+                # BEiT-style model with native masked position support
+                outputs = model(samples, bool_masked_pos=bool_masked_pos, return_all_tokens=False)
+            else:
+                # SWIN or other models: get all features then select masked positions
+                # For SWIN, we need to get features and project to vocab size
+                features = model.forward_features(samples)  # Could be [B, num_patches, embed_dim] or [B, H, W, C]
+                
+                # Handle 4D features (B, H, W, C) -> (B, L, C)
+                if features.dim() == 4:
+                    B, H, W, C = features.shape
+                    features = features.reshape(B, H * W, C)
+                
+                # If model has a head for MIM prediction, use it; otherwise need a projection
+                if hasattr(model, 'lm_head'):
+                    all_outputs = model.lm_head(features)
+                elif hasattr(model, 'head'):
+                    # Flatten and apply head
+                    B, N, C = features.shape
+                    all_outputs = model.head(features.reshape(B * N, C)).reshape(B, N, -1)
+                else:
+                    # Fallback: need to add a projection layer (this case shouldn't happen ideally)
+                    raise ValueError("Model does not have lm_head or head for MIM prediction. "
+                                     "Consider using a BEiT model or adding a prediction head.")
+                # Select outputs at masked positions
+                outputs = all_outputs[bool_masked_pos]
+            loss = nn.CrossEntropyLoss()(input=outputs, target=labels)
 
         loss_value = loss.item()
 
@@ -91,6 +137,9 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
                 weight_decay_value = group["weight_decay"]
         metric_logger.update(weight_decay=weight_decay_value)
         metric_logger.update(grad_norm=grad_norm)
+
+        # Update tqdm progress bar
+        pbar.set_postfix({'loss': f'{loss_value:.4f}', 'acc': f'{mlm_acc:.4f}', 'lr': f'{max_lr:.2e}'})
 
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")

@@ -17,7 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
-from visualizer import get_local
+try:
+    from visualizer import get_local
+except ImportError:
+    # Create a no-op decorator when visualizer is not available
+    def get_local(name):
+        def decorator(func):
+            return func
+        return decorator
 
 def _cfg(url='', **kwargs):
     return {

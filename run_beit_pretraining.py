@@ -27,7 +27,6 @@ from datasets import build_beit_pretraining_dataset
 from engine_for_pretraining import train_one_epoch
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
-import modeling_pretrain
 
 
 def get_args():
@@ -139,15 +138,45 @@ def get_args():
 
 def get_model(args):
     print(f"Creating model: {args.model}")
-    model = create_model(
-        args.model,
-        pretrained=False,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        use_shared_rel_pos_bias=args.rel_pos_bias,
-        use_abs_pos_emb=args.abs_pos_emb,
-        init_values=args.layer_scale_init_value,
-    )
+    
+    # Check if it's a SWIN MIM model
+    if 'swin' in args.model.lower() and '8k_vocab' in args.model:
+        from modeling_pretrain import SwinTransformerForMaskedImageModeling
+        
+        # Determine base or large variant
+        if 'large' in args.model.lower():
+            model = SwinTransformerForMaskedImageModeling(
+                img_size=224,
+                patch_size=4,
+                embed_dim=192,
+                depths=[2, 2, 18, 2],
+                num_heads=[6, 12, 24, 48],
+                window_size=7,
+                vocab_size=8192,
+                drop_path_rate=args.drop_path,
+            )
+        else:  # base
+            model = SwinTransformerForMaskedImageModeling(
+                img_size=224,
+                patch_size=4,
+                embed_dim=128,
+                depths=[2, 2, 18, 2],
+                num_heads=[4, 8, 16, 32],
+                window_size=7,
+                vocab_size=8192,
+                drop_path_rate=args.drop_path,
+            )
+    else:
+        # Use timm for BEiT and other models
+        model = create_model(
+            args.model,
+            pretrained=False,
+            drop_path_rate=args.drop_path,
+            drop_block_rate=None,
+            use_shared_rel_pos_bias=args.rel_pos_bias,
+            use_abs_pos_emb=args.abs_pos_emb,
+            init_values=args.layer_scale_init_value,
+        )
 
     return model
 

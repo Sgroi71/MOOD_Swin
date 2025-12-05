@@ -10,7 +10,7 @@ Lo script sovrascrive alcuni argomenti di default (modello, dataset) e inoltra i
 alla funzione `main` di `run_beit_pretraining`.
 
 COME USARE CON PIÙ GPU:
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 MOODv1/run_beit_pretraining.py --config configs/swin_mim.yaml
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 train_swin_mim.py --config configs/swin_mim.yaml
 """
 import os
 import sys
@@ -45,12 +45,14 @@ def main():
     parser.add_argument('--config', '--config_path', '-c', dest='config_path', type=str,
                         default=os.path.join(ROOT, 'configs', 'swin_mim.yaml'),
                         help='Percorso del file YAML di configurazione')
-    args, _ = parser.parse_known_args()
+    args, remaining = parser.parse_known_args()
     config_path = args.config_path
     yaml_cfg = _load_yaml_config(config_path)
 
-    # recupera l'argparser della pipeline originale (namespace con defaults)
+    original_argv = sys.argv
+    sys.argv = [sys.argv[0]] + remaining  # passa solo gli argomenti rimanenti (non --config)
     rb_args = rb.get_args()
+    sys.argv = original_argv  # ripristina
 
     # mappatura alias YAML -> arg names della pipeline
     alias_map = {
@@ -94,6 +96,7 @@ def main():
     print('Batch size:', rb_args.batch_size)
     print('Epochs:', rb_args.epochs)
     print('Output dir:', rb_args.output_dir)
+
 
     rb.main(rb_args)
 

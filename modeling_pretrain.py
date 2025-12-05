@@ -24,7 +24,9 @@ def trunc_normal_(tensor, mean=0., std=1.):
 
 __all__ = [
     'beit_base_patch16_224_8k_vocab', 
-    'beit_large_patch16_224_8k_vocab', 
+    'beit_large_patch16_224_8k_vocab',
+    'swin_base_patch4_window7_224_8k_vocab',
+    'swin_large_patch4_window7_224_8k_vocab',
 ]
 
 
@@ -163,4 +165,182 @@ def beit_large_patch16_224_8k_vocab(pretrained=False, **kwargs):
             kwargs["init_ckpt"], map_location="cpu"
         )
         model.load_state_dict(checkpoint["model"])
+    return model
+
+
+# ============================================================================
+# SWIN Transformer wrapper for Masked Image Modeling (MIM)
+# ============================================================================
+
+class SwinTransformerForMaskedImageModeling(nn.Module):
+    """
+    Wrapper around timm's SwinTransformer for Masked Image Modeling.
+    Adds mask token and lm_head for predicting visual tokens at masked positions.
+    """
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, vocab_size=8192, 
+                 embed_dim=128, depths=[2, 2, 18, 2], num_heads=[4, 8, 16, 32],
+                 window_size=7, mlp_ratio=4., qkv_bias=True, drop_rate=0., 
+                 attn_drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm,
+                 pretrained=False, **kwargs):
+        super().__init__()
+        from timm.models.swin_transformer import SwinTransformer
+        
+        # Create base SWIN model
+        self.swin = SwinTransformer(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            num_classes=0,  # No classification head
+            embed_dim=embed_dim,
+            depths=depths,
+            num_heads=num_heads,
+            window_size=window_size,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
+            norm_layer=norm_layer,
+        )
+        
+        self.patch_size = patch_size
+        self.img_size = img_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        
+        # Get the final feature dimension from SWIN
+        # SWIN's final dim is embed_dim * 2^(num_stages-1)
+        self.final_dim = embed_dim * (2 ** (len(depths) - 1))
+        
+        # Mask token for replacing masked patches (at initial embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # LM head to predict vocabulary from final features
+        self.lm_head = nn.Linear(self.final_dim, vocab_size)
+        
+        # Initialize
+        trunc_normal_(self.mask_token, std=0.02)
+        trunc_normal_(self.lm_head.weight, std=0.02)
+        
+        self.patch_embed = self.swin.patch_embed
+        # Ensure patch_size is accessible as tuple (for compatibility with run_beit_pretraining.py)
+        if not hasattr(self.patch_embed, 'patch_size') or not isinstance(getattr(self.patch_embed, 'patch_size', None), tuple):
+            self.patch_embed.patch_size = (patch_size, patch_size)
+        
+    def forward_features(self, x, bool_masked_pos=None):
+        """Extract features with masking applied at patch embedding stage."""
+        # Use SWIN's forward_features but inject masking
+        # First get patch embeddings
+        x = self.swin.patch_embed(x)
+        
+        # x shape depends on timm version, could be (B, H, W, C) or (B, L, C)
+        original_shape = x.shape
+        if x.dim() == 4:
+            B, H, W, C = x.shape
+            x = x.reshape(B, H * W, C)
+        else:
+            B, L, C = x.shape
+            H = W = int(L ** 0.5)
+        
+        # Apply mask if provided
+        if bool_masked_pos is not None:
+            mask_token = self.mask_token.expand(B, x.shape[1], -1)
+            w = bool_masked_pos.unsqueeze(-1).type_as(mask_token)
+            x = x * (1 - w) + mask_token * w
+        
+        # Reshape back for SWIN layers
+        x = x.reshape(B, H, W, C)
+        
+        # Continue with rest of SWIN forward
+        # Use internal forward, handling different timm versions
+        if hasattr(self.swin, 'drop_after_pos'):
+            x = self.swin.drop_after_pos(x)
+        
+        # Apply SWIN layers
+        x = self.swin.layers(x)
+        x = self.swin.norm(x)
+        
+        # Flatten: (B, H', W', C') -> (B, L', C')
+        if x.dim() == 4:
+            B, H, W, C = x.shape
+            x = x.reshape(B, H * W, C)
+        
+        return x
+    
+    def forward(self, x, bool_masked_pos=None, return_all_tokens=False):
+        """
+        Args:
+            x: input images [B, C, H, W]
+            bool_masked_pos: boolean mask [B, num_patches] indicating masked positions
+            return_all_tokens: if True, return predictions for all tokens
+        """
+        # Get features [B, num_patches_after_swin, final_dim]
+        features = self.forward_features(x, bool_masked_pos=bool_masked_pos)
+        
+        # SWIN reduces spatial resolution through stages
+        # We need to interpolate back to original patch count if needed
+        B, L, C = features.shape
+        target_patches = self.num_patches
+        
+        if L != target_patches:
+            # Reshape to spatial, interpolate, reshape back
+            h = w = int(L ** 0.5)
+            features = features.transpose(1, 2).reshape(B, C, h, w)
+            target_h = target_w = int(target_patches ** 0.5)
+            features = nn.functional.interpolate(features, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            features = features.reshape(B, C, target_patches).transpose(1, 2)
+        
+        # Predict vocabulary logits
+        logits = self.lm_head(features)  # [B, num_patches, vocab_size]
+        
+        if return_all_tokens:
+            return logits
+        else:
+            # Return only masked token predictions
+            return logits[bool_masked_pos]
+
+
+# @register_model
+# def swin_base_patch4_window7_224_8k_vocab(pretrained=False, **kwargs):
+#     """SWIN-Base for MIM with 8k vocabulary."""
+#     # Remove args not used by our wrapper
+#     kwargs.pop('use_shared_rel_pos_bias', None)
+#     kwargs.pop('use_abs_pos_emb', None)
+#     kwargs.pop('init_values', None)
+    
+#     model = SwinTransformerForMaskedImageModeling(
+#         img_size=224, 
+#         patch_size=4, 
+#         embed_dim=128,
+#         depths=[2, 2, 18, 2],
+#         num_heads=[4, 8, 16, 32],
+#         window_size=7,
+#         vocab_size=8192,
+#         drop_path_rate=kwargs.pop('drop_path_rate', 0.1),
+#         **kwargs
+#     )
+#     model.default_cfg = _cfg()
+#     return model
+
+
+@register_model  
+def swin_large_patch4_window7_224_8k_vocab(pretrained=False, **kwargs):
+    """SWIN-Large for MIM with 8k vocabulary."""
+    kwargs.pop('use_shared_rel_pos_bias', None)
+    kwargs.pop('use_abs_pos_emb', None)
+    kwargs.pop('init_values', None)
+    
+    model = SwinTransformerForMaskedImageModeling(
+        img_size=224,
+        patch_size=4,
+        embed_dim=192,
+        depths=[2, 2, 18, 2],
+        num_heads=[6, 12, 24, 48],
+        window_size=7,
+        vocab_size=8192,
+        drop_path_rate=kwargs.pop('drop_path_rate', 0.1),
+        **kwargs
+    )
+    model.default_cfg = _cfg()
     return model

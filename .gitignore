@@ -6,3 +6,4 @@ pretrained/
 tokenizer/
 *.sh
 eval_results/
+venv/
