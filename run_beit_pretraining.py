@@ -37,6 +37,8 @@ def get_args():
     parser.add_argument('--save_ckpt_freq', default=20, type=int)
     parser.add_argument("--discrete_vae_weight_path", type=str)
     parser.add_argument("--discrete_vae_type", type=str, default="dall-e")
+    parser.add_argument('--precomputed_tokens_path', type=str, default=None,
+                        help='Path to precomputed VAE tokens file (vae_tokens.pt). If set, skips VAE forward.')
     parser.add_argument('--data_set', default='cifar10', choices=['cifar10', 'cifar100', 'imagenet30'],
                         type=str, help='ImageNet dataset path')
     parser.add_argument('--class_idx', help='None: multi-class, Not None: one-class', default=None, type=int)
@@ -202,13 +204,22 @@ def main(args):
     args.window_size = (args.input_size // patch_size[0], args.input_size // patch_size[1])
     args.patch_size = patch_size
 
-    # get dataset
-    dataset_train = build_beit_pretraining_dataset(args, args.data_set)
-
-    # prepare discrete vae
-    d_vae = utils.create_d_vae(
-        weight_path=args.discrete_vae_weight_path, d_vae_type=args.discrete_vae_type,
-        device=device, image_size=args.second_input_size)
+    # Check if using precomputed tokens
+    use_precomputed_tokens = args.precomputed_tokens_path is not None and os.path.exists(args.precomputed_tokens_path)
+    
+    if use_precomputed_tokens:
+        print(f"Using PRECOMPUTED VAE tokens from: {args.precomputed_tokens_path}")
+        from datasets import build_precomputed_tokens_dataset
+        dataset_train = build_precomputed_tokens_dataset(args)
+        d_vae = None  # Not needed!
+    else:
+        print("Using on-the-fly VAE token computation")
+        # get dataset
+        dataset_train = build_beit_pretraining_dataset(args, args.data_set)
+        # prepare discrete vae
+        d_vae = utils.create_d_vae(
+            weight_path=args.discrete_vae_weight_path, d_vae_type=args.discrete_vae_type,
+            device=device, image_size=args.second_input_size)
 
     if True:  # args.distributed:
         num_tasks = utils.get_world_size()
@@ -285,14 +296,27 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch)
-        train_stats = train_one_epoch(
-            model, d_vae, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, log_writer=log_writer,
-            start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values,
-            wd_schedule_values=wd_schedule_values,
-        )
+        
+        # Use appropriate training function based on token source
+        if use_precomputed_tokens:
+            from engine_for_pretraining import train_one_epoch_precomputed
+            train_stats = train_one_epoch_precomputed(
+                model, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, log_writer=log_writer,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+                wd_schedule_values=wd_schedule_values,
+            )
+        else:
+            train_stats = train_one_epoch(
+                model, d_vae, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, log_writer=log_writer,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+                wd_schedule_values=wd_schedule_values,
+            )
         if args.output_dir:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
                 utils.save_model(

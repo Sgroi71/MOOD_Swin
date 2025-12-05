@@ -362,3 +362,101 @@ def build_transform(is_train, args):
     return transforms.Compose(t)
 
 
+# ============================================================================
+# Dataset with precomputed VAE tokens (for faster MIM training)
+# ============================================================================
+
+class DataAugmentationForBEiTWithPrecomputedTokens(object):
+    """
+    Data augmentation for BEiT/MIM training with precomputed VAE tokens.
+    Only applies transforms to the input patches, not to VAE images.
+    """
+    def __init__(self, args):
+        imagenet_default_mean_and_std = args.imagenet_default_mean_and_std
+        mean = IMAGENET_INCEPTION_MEAN if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_MEAN
+        std = IMAGENET_INCEPTION_STD if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_STD
+
+        self.patch_transform = transforms.Compose([
+            transforms.RandomResizedCrop(args.input_size, scale=(0.67, 1.0), 
+                                         interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(0.4, 0.4, 0.4),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=torch.tensor(mean), std=torch.tensor(std))
+        ])
+
+        self.masked_position_generator = MaskingGenerator(
+            args.window_size, num_masking_patches=args.num_mask_patches,
+            max_num_patches=args.max_mask_patches_per_block,
+            min_num_patches=args.min_mask_patches_per_block,
+        )
+
+    def __call__(self, image):
+        patches = self.patch_transform(image)
+        mask = self.masked_position_generator()
+        return patches, mask
+
+
+class PrecomputedTokensDataset(torch.utils.data.Dataset):
+    """
+    Dataset that loads precomputed VAE tokens instead of computing them on-the-fly.
+    Significantly speeds up MIM training by avoiding VAE forward pass each batch.
+    """
+    def __init__(self, image_folder_path, tokens_path, transform):
+        """
+        Args:
+            image_folder_path: Path to ImageNet train folder
+            tokens_path: Path to precomputed vae_tokens.pt file
+            transform: DataAugmentationForBEiTWithPrecomputedTokens instance
+        """
+        self.transform = transform
+        
+        # Load image dataset (for getting images)
+        self.image_dataset = datasets.ImageFolder(image_folder_path)
+        
+        # Load precomputed tokens
+        print(f"Loading precomputed VAE tokens from {tokens_path}...")
+        token_data = torch.load(tokens_path)
+        self.tokens = token_data['tokens']
+        
+        assert len(self.tokens) == len(self.image_dataset), \
+            f"Token count ({len(self.tokens)}) doesn't match image count ({len(self.image_dataset)})"
+        
+        print(f"Loaded {len(self.tokens)} precomputed tokens, shape: {self.tokens.shape}")
+    
+    def __len__(self):
+        return len(self.image_dataset)
+    
+    def __getitem__(self, idx):
+        # Get image and apply transforms
+        image, _ = self.image_dataset[idx]
+        patches, mask = self.transform(image)
+        
+        # Get precomputed tokens
+        tokens = self.tokens[idx]
+        
+        # Return: (patches for model, precomputed tokens, mask)
+        return patches, tokens, mask
+
+
+def build_precomputed_tokens_dataset(args):
+    """
+    Build dataset with precomputed VAE tokens.
+    Requires args.precomputed_tokens_path to be set.
+    """
+    transform = DataAugmentationForBEiTWithPrecomputedTokens(args)
+    
+    image_path = args.data_path
+    if not os.path.isdir(os.path.join(image_path, 'train')):
+        # data_path is already the train folder
+        train_path = image_path
+    else:
+        train_path = os.path.join(image_path, 'train')
+    
+    dataset = PrecomputedTokensDataset(
+        image_folder_path=train_path,
+        tokens_path=args.precomputed_tokens_path,
+        transform=transform,
+    )
+    
+    return dataset

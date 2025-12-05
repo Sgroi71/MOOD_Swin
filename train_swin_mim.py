@@ -70,6 +70,7 @@ def main():
         'input_size': 'input_size',
         'second_input_size': 'second_input_size',
         'trial': 'trial',
+        'precomputed_tokens_path': 'precomputed_tokens_path',
     }
 
     # Applica i valori del YAML sull'oggetto rb_args
